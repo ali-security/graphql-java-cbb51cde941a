@@ -139,6 +139,8 @@ shadowJar {
         include 'com.google.common.primitives.*'
     }
     relocate('org.antlr.v4.runtime', 'graphql.org.antlr.v4.runtime')
+    // Patched Guava classes under src/main/java/com/google/common are copied before the dependencies,
+    // so they replace the same classes of the Guava jar (shadow keeps the first entry for a path)
     dependencies {
         include(dependency('com.google.guava:guava:' + guavaVersion))
         include(dependency('org.antlr:antlr4-runtime:' + antlrVersion))
@@ -237,6 +239,8 @@ task javadocJar(type: Jar, dependsOn: javadoc) {
 
 javadoc {
     options.encoding = 'UTF-8'
+    // patched Guava sources that are shaded into the jar, not graphql-java API
+    exclude('com/google/**')
 }
 
 artifacts {
