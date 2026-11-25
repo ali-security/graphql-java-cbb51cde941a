@@ -6,10 +6,16 @@ on:
       version:
         description: 'the version to be released'
         required: true
+        default: '21.5'
+      test-filter:
+        description: 'Gradle test task selector (e.g. ":test --tests graphql.FooTest"); empty runs the full check'
+        required: false
+        default: ''
 
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAVEN_CENTRAL_PGP_KEY: ${{ secrets.MAVEN_CENTRAL_PGP_KEY }}
       MAVEN_CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USER }}
@@ -24,5 +30,89 @@ jobs:
         with:
           java-version: '11'
           distribution: 'corretto'
+          cache: gradle
       - name: build test and publish
-        run: ./gradlew assemble && ./gradlew check --info && ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -x check --info --stacktrace
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble --no-build-cache && ./gradlew ${{ inputs.test-filter }} --info --no-build-cache && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --info --stacktrace --no-build-cache
+          else
+            ./gradlew assemble --no-build-cache && ./gradlew check --info --no-build-cache && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --info --stacktrace --no-build-cache
+          fi
+      - name: upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphql-java-jar
+          path: build/libs/graphql-java-${{ github.event.inputs.version }}.jar
+          if-no-files-found: error
+      - name: test results summary
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, re
+          import xml.etree.ElementTree as ET
+
+          TCK_REASONS = [
+              ("untested_", "reactive-streams TCK 1.0.3: rule not verified by the TCK (notVerified SkipException)"),
+              ("optional_spec111", "reactive-streams TCK 1.0.3: optional multi-subscribe rule not supported by this publisher"),
+              ("required_spec317", "reactive-streams TCK 1.0.3: publisher cannot emit 2147483647 elements (> maxElementsFromPublisher 10000)"),
+          ]
+
+          def source_reason(classname, testname):
+              simple = classname.split(".")[-1]
+              for path in glob.glob("src/test/**/" + simple + ".*", recursive=True):
+                  lines = open(path, encoding="utf-8").read().splitlines()
+                  for i, line in enumerate(lines):
+                      if "@Ignore" not in line:
+                          continue
+                      nxt = " ".join(lines[i + 1:i + 3])
+                      if testname not in nxt and not re.search(r"\bclass\s+" + simple + r"\b", nxt):
+                          continue
+                      m = re.search(r'@Ignore\("(.*)"\)', line)
+                      if m:
+                          return "@Ignore: " + m.group(1)
+                      j = i - 1
+                      comment = []
+                      while j >= 0 and lines[j].strip().startswith(("//", "*", "/*")):
+                          comment.insert(0, lines[j].strip().lstrip("/* ").strip())
+                          j -= 1
+                      text = " ".join(c for c in comment if c)
+                      return "@Ignore in source" + (": " + text if text else "")
+              return None
+
+          totals = {}
+          skipped = []
+          for suite in ("test", "testng"):
+              t = f = e = s = 0
+              for xf in glob.glob(f"build/test-results/{suite}/*.xml"):
+                  root = ET.parse(xf).getroot()
+                  for tc in root.iter("testcase"):
+                      t += 1
+                      if tc.find("failure") is not None:
+                          f += 1
+                      elif tc.find("error") is not None:
+                          e += 1
+                      elif tc.find("skipped") is not None:
+                          s += 1
+                          sk = tc.find("skipped")
+                          cls, name = tc.get("classname", ""), tc.get("name", "")
+                          reason = sk.get("message")
+                          if not reason:
+                              for prefix, r in TCK_REASONS:
+                                  if name.startswith(prefix):
+                                      reason = r
+                                      break
+                          if not reason:
+                              reason = source_reason(cls, name) or "no reason recorded by runner"
+                          skipped.append((suite, cls, name, reason))
+              totals[suite] = (t, t - f - e - s, f, e, s)
+
+          print("==================== TEST SUMMARY ====================")
+          gt = [0, 0, 0, 0, 0]
+          for suite, vals in totals.items():
+              print(f"Gradle task '{suite}': tests={vals[0]} passed={vals[1]} failed={vals[2]} errors={vals[3]} skipped={vals[4]}")
+              gt = [a + b for a, b in zip(gt, vals)]
+          print(f"TOTAL: tests={gt[0]} passed={gt[1]} failed={gt[2]} errors={gt[3]} skipped={gt[4]}")
+          print("==================== SKIPPED TESTS ====================")
+          for suite, cls, name, reason in skipped:
+              print(f"SKIPPED [{suite}] {cls} > {name} -- reason: {reason}")
+          print("=======================================================")
